@@ -821,39 +821,63 @@ static ada_really_inline void percent_encode_to(const char* p, const char* pend,
   }
 }
 
+#if ADA_SSSE3
+// Keep the long-input SSSE3 encode path out of line so the common no-op/short
+// case stays close to main's scalar-only implementation.
+static ada_never_inline std::string percent_encode_ssse3_from_index(
+    const std::string_view input, const uint8_t character_set[],
+    size_t first_idx) {
+  ssse3_encode_luts luts(character_set);
+  std::string result;
+  result.reserve(input.length());
+  result.append(input.substr(0, first_idx));
+  percent_encode_to_simd(input.data() + first_idx, input.data() + input.size(),
+                         character_set, result, luts);
+  return result;
+}
+
+template <bool append>
+static ada_never_inline bool percent_encode_ssse3_from_index(
+    const std::string_view input, const uint8_t character_set[],
+    std::string& out, size_t first_idx) {
+  ssse3_encode_luts luts(character_set);
+  if constexpr (!append) {
+    out.clear();
+  }
+  ada_log("percent_encode appending ", first_idx, " bytes");
+  out.append(input.substr(0, first_idx));
+  ada_log("percent_encode processing ", input.size() - first_idx, " bytes");
+  percent_encode_to_simd(input.data() + first_idx, input.data() + input.size(),
+                         character_set, out, luts);
+  return true;
+}
+#endif
+
 std::string percent_encode(const std::string_view input,
                            const uint8_t character_set[]) {
 #if ADA_SSSE3
-  if (input.size() >= 48) {
-    ssse3_encode_luts luts(character_set);
-    size_t first_idx = percent_encode_index_simd(input, character_set, luts);
-    if (first_idx == input.size()) return std::string(input);
-    std::string result;
-    result.reserve(input.length());
-    result.append(input.substr(0, first_idx));
-    percent_encode_to_simd(input.data() + first_idx,
-                           input.data() + input.size(), character_set, result,
-                           luts);
-    return result;
+  auto pointer = std::ranges::find_if(input, [character_set](const char c) {
+    return character_sets::bit_at(character_set, c);
+  });
+  if (pointer == input.end()) {
+    return std::string(input);
   }
-  {
-    auto pointer = std::ranges::find_if(input, [character_set](const char c) {
-      return character_sets::bit_at(character_set, c);
-    });
-    if (pointer == input.end()) return std::string(input);
-    std::string result;
-    result.reserve(input.length());
-    result.append(input.substr(0, std::distance(input.begin(), pointer)));
-    for (; pointer != input.end(); pointer++) {
-      if (character_sets::bit_at(character_set, *pointer)) {
-        result.append(character_sets::hex + uint8_t(*pointer) * 4, 3);
-      } else {
-        result += *pointer;
-      }
+  size_t first_idx = size_t(std::distance(input.begin(), pointer));
+  if (input.size() - first_idx >= 48) {
+    return percent_encode_ssse3_from_index(input, character_set, first_idx);
+  }
+  std::string result;
+  result.reserve(input.length());
+  result.append(input.substr(0, first_idx));
+  for (; pointer != input.end(); pointer++) {
+    if (character_sets::bit_at(character_set, *pointer)) {
+      result.append(character_sets::hex + uint8_t(*pointer) * 4, 3);
+    } else {
+      result += *pointer;
     }
-    return result;
   }
-#endif
+  return result;
+#else
   size_t first_idx = percent_encode_index(input, character_set);
   if (first_idx == input.size()) {
     return std::string(input);
@@ -864,6 +888,7 @@ std::string percent_encode(const std::string_view input,
   percent_encode_to(input.data() + first_idx, input.data() + input.size(),
                     character_set, result);
   return result;
+#endif
 }
 
 template <bool append>
@@ -872,53 +897,36 @@ bool percent_encode(const std::string_view input, const uint8_t character_set[],
   ada_log("percent_encode ", input, " to output string while ",
           append ? "appending" : "overwriting");
 #if ADA_SSSE3
-  if (input.size() >= 48) {
-    ssse3_encode_luts luts(character_set);
-    size_t first_idx = percent_encode_index_simd(input, character_set, luts);
-    ada_log("percent_encode done checking, moved to ", first_idx);
-    if (first_idx == input.size()) {
-      ada_log("percent_encode encoding not needed.");
-      return false;
-    }
-    if constexpr (!append) {
-      out.clear();
-    }
-    ada_log("percent_encode appending ", first_idx, " bytes");
-    out.append(input.substr(0, first_idx));
-    ada_log("percent_encode processing ", input.size() - first_idx, " bytes");
-    percent_encode_to_simd(input.data() + first_idx,
-                           input.data() + input.size(), character_set, out,
-                           luts);
-    return true;
+  auto pointer = std::ranges::find_if(input, [character_set](const char c) {
+    return character_sets::bit_at(character_set, c);
+  });
+  size_t first_idx = size_t(std::distance(input.begin(), pointer));
+  ada_log("percent_encode done checking, moved to ", first_idx);
+  if (pointer == input.end()) {
+    ada_log("percent_encode encoding not needed.");
+    return false;
   }
-  {
-    auto pointer = std::ranges::find_if(input, [character_set](const char c) {
-      return character_sets::bit_at(character_set, c);
-    });
-    ada_log("percent_encode done checking, moved to ",
-            std::distance(input.begin(), pointer));
-    if (pointer == input.end()) {
-      ada_log("percent_encode encoding not needed.");
-      return false;
-    }
-    if constexpr (!append) {
-      out.clear();
-    }
-    ada_log("percent_encode appending ", std::distance(input.begin(), pointer),
-            " bytes");
-    out.append(input.data(), std::distance(input.begin(), pointer));
-    ada_log("percent_encode processing ", std::distance(pointer, input.end()),
-            " bytes");
-    for (; pointer != input.end(); pointer++) {
-      if (character_sets::bit_at(character_set, *pointer)) {
-        out.append(character_sets::hex + uint8_t(*pointer) * 4, 3);
-      } else {
-        out += *pointer;
-      }
-    }
-    return true;
+  if (input.size() - first_idx >= 48) {
+    return percent_encode_ssse3_from_index<append>(input, character_set, out,
+                                                   first_idx);
   }
-#endif
+  if constexpr (!append) {
+    out.clear();
+  }
+  ada_log("percent_encode appending ", first_idx, " bytes");
+  // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage)
+  out.append(input.data(), first_idx);
+  ada_log("percent_encode processing ", std::distance(pointer, input.end()),
+          " bytes");
+  for (; pointer != input.end(); pointer++) {
+    if (character_sets::bit_at(character_set, *pointer)) {
+      out.append(character_sets::hex + uint8_t(*pointer) * 4, 3);
+    } else {
+      out += *pointer;
+    }
+  }
+  return true;
+#else
   size_t first_idx = percent_encode_index(input, character_set);
   ada_log("percent_encode done checking, moved to ", first_idx);
 
@@ -935,6 +943,7 @@ bool percent_encode(const std::string_view input, const uint8_t character_set[],
   percent_encode_to(input.data() + first_idx, input.data() + input.size(),
                     character_set, out);
   return true;
+#endif
 }
 
 bool to_ascii(std::optional<std::string>& out, const std::string_view plain,
