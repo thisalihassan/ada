@@ -597,58 +597,139 @@ std::string percent_decode(const std::string_view input, size_t first_percent) {
   // SIMD fast path: scan 16 bytes at a time for '%'.
   // When no '%' is found in a chunk, bulk-append all 16 bytes.
 #if ADA_SSSE3 || ADA_SSE2
-  const __m128i pct = _mm_set1_epi8('%');
-  while (pointer + 15 < end) {
-    __m128i word = _mm_loadu_si128((const __m128i*)pointer);
-    int mask = _mm_movemask_epi8(_mm_cmpeq_epi8(word, pct));
-    if (mask == 0) {
-      dest.append(pointer, 16);
-      pointer += 16;
-      continue;
-    }
-    int skip = trailing_zeroes(mask);
-    if (skip > 0) {
-      dest.append(pointer, skip);
-      pointer += skip;
-    }
-    size_t remaining = end - pointer - 1;
-    if (remaining >= 2 && is_ascii_hex_digit(pointer[1]) &&
-        is_ascii_hex_digit(pointer[2])) {
-      unsigned a = convert_hex_to_binary(pointer[1]);
-      unsigned b = convert_hex_to_binary(pointer[2]);
-      dest += static_cast<char>(a * 16 + b);
-      pointer += 3;
-    } else {
-      dest += pointer[0];
-      pointer++;
+  {
+    const __m128i pct = _mm_set1_epi8('%');
+    const __m128i ascii_zero_biased = _mm_set1_epi8('0' + char(128u));
+    const __m128i digit_limit = _mm_set1_epi8(char(-128 + 10));
+    const __m128i lower_mask = _mm_set1_epi8(0x20);
+    const __m128i alpha_bias = _mm_set1_epi8('a' - 10);
+    const __m128i nibble_mask = _mm_set1_epi8(0x0F);
+    while (pointer + 15 < end) {
+      __m128i chunk = _mm_loadu_si128((const __m128i*)pointer);
+      int pct_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, pct));
+
+      if (pct_mask == 0) {
+        dest.append(pointer, 16);
+        pointer += 16;
+        continue;
+      }
+
+      // SIMD hex decode: numbers vs letters classification + blend.
+      // Bias subtraction trick for unsigned < 10 comparison with signed cmplt.
+      __m128i digit_off = _mm_sub_epi8(chunk, _mm_set1_epi8('0'));
+      __m128i biased = _mm_sub_epi8(chunk, ascii_zero_biased);
+      __m128i is_digit = _mm_cmplt_epi8(biased, digit_limit);
+
+      __m128i lowered = _mm_or_si128(chunk, lower_mask);
+      __m128i alpha_off = _mm_sub_epi8(lowered, alpha_bias);
+
+      __m128i hex_vals = _mm_or_si128(_mm_and_si128(is_digit, digit_off),
+                                      _mm_andnot_si128(is_digit, alpha_off));
+      hex_vals = _mm_and_si128(hex_vals, nibble_mask);
+
+      // Combine adjacent nibbles. slli_epi16 shifts 16-bit lanes but values
+      // are <= 0x0F so no cross-byte bleed within the lane.
+      __m128i high_nibble = _mm_slli_epi16(hex_vals, 4);
+      __m128i low_nibble = _mm_srli_si128(hex_vals, 1);
+      __m128i decoded_vec = _mm_or_si128(high_nibble, low_nibble);
+
+      alignas(16) uint8_t decoded_arr[16];
+      _mm_store_si128((__m128i*)decoded_arr, decoded_vec);
+
+      char outbuf[16];
+      size_t outlen = 0;
+      size_t i = 0;
+      for (; i < 16;) {
+        if ((pct_mask >> i) & 1) {
+          size_t remaining = static_cast<size_t>(end - (pointer + i)) - 1;
+          if (remaining >= 2 && is_ascii_hex_digit(pointer[i + 1]) &&
+              is_ascii_hex_digit(pointer[i + 2])) {
+            if (i + 2 < 16) {
+              outbuf[outlen++] = static_cast<char>(decoded_arr[i + 1]);
+            } else {
+              unsigned a = convert_hex_to_binary(pointer[i + 1]);
+              unsigned b = convert_hex_to_binary(pointer[i + 2]);
+              outbuf[outlen++] = static_cast<char>(a * 16 + b);
+            }
+            i += 3;
+          } else {
+            outbuf[outlen++] = pointer[i];
+            i++;
+          }
+        } else {
+          outbuf[outlen++] = pointer[i];
+          i++;
+        }
+      }
+      dest.append(outbuf, outlen);
+      pointer += i;
     }
   }
 #elif ADA_NEON
-  const uint8x16_t pct_vec = vdupq_n_u8('%');
-  while (pointer + 15 < end) {
-    uint8x16_t word = vld1q_u8((const uint8_t*)pointer);
-    uint8x16_t cmp = vceqq_u8(word, pct_vec);
-    if (vmaxvq_u32(vreinterpretq_u32_u8(cmp)) == 0) {
-      dest.append(pointer, 16);
-      pointer += 16;
-      continue;
-    }
-    size_t skip = 0;
-    while (skip < 16 && pointer[skip] != '%') skip++;
-    if (skip > 0) {
-      dest.append(pointer, skip);
-      pointer += skip;
-    }
-    size_t remaining = end - pointer - 1;
-    if (remaining >= 2 && is_ascii_hex_digit(pointer[1]) &&
-        is_ascii_hex_digit(pointer[2])) {
-      unsigned a = convert_hex_to_binary(pointer[1]);
-      unsigned b = convert_hex_to_binary(pointer[2]);
-      dest += static_cast<char>(a * 16 + b);
-      pointer += 3;
-    } else {
-      dest += pointer[0];
-      pointer++;
+  {
+    const uint8x16_t pct_vec = vdupq_n_u8('%');
+    alignas(16) static const uint8_t powers_arr[] = {
+        1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x16_t powers = vld1q_u8(powers_arr);
+    while (pointer + 15 < end) {
+      uint8x16_t chunk = vld1q_u8((const uint8_t*)pointer);
+      uint8x16_t pct_cmp = vceqq_u8(chunk, pct_vec);
+
+      if (vmaxvq_u32(vreinterpretq_u32_u8(pct_cmp)) == 0) {
+        dest.append(pointer, 16);
+        pointer += 16;
+        continue;
+      }
+
+      uint8x16_t masked_bits = vandq_u8(pct_cmp, powers);
+      uint16_t pct_mask =
+          static_cast<uint16_t>(vaddv_u8(vget_low_u8(masked_bits))) |
+          static_cast<uint16_t>(
+              static_cast<uint16_t>(vaddv_u8(vget_high_u8(masked_bits))) << 8);
+
+      // SIMD hex decode: classify every byte as digit / letter, convert to
+      // 0-15, then combine adjacent nibbles into decoded bytes.
+      uint8x16_t digit_off = vsubq_u8(chunk, vdupq_n_u8('0'));
+      uint8x16_t is_digit = vcltq_u8(digit_off, vdupq_n_u8(10));
+      uint8x16_t lowered = vorrq_u8(chunk, vdupq_n_u8(0x20));
+      uint8x16_t alpha_off = vsubq_u8(lowered, vdupq_n_u8('a' - 10));
+      uint8x16_t hex_vals = vbslq_u8(is_digit, digit_off, alpha_off);
+      hex_vals = vandq_u8(hex_vals, vdupq_n_u8(0x0F));
+
+      uint8x16_t high_nibble = vshlq_n_u8(hex_vals, 4);
+      uint8x16_t low_nibble = vextq_u8(hex_vals, vdupq_n_u8(0), 1);
+      uint8x16_t decoded_vec = vorrq_u8(high_nibble, low_nibble);
+
+      alignas(16) uint8_t decoded_arr[16];
+      vst1q_u8(decoded_arr, decoded_vec);
+
+      char outbuf[16];
+      size_t outlen = 0;
+      size_t i = 0;
+      for (; i < 16;) {
+        if ((pct_mask >> i) & 1) {
+          size_t remaining = static_cast<size_t>(end - (pointer + i)) - 1;
+          if (remaining >= 2 && is_ascii_hex_digit(pointer[i + 1]) &&
+              is_ascii_hex_digit(pointer[i + 2])) {
+            if (i + 2 < 16) {
+              outbuf[outlen++] = static_cast<char>(decoded_arr[i + 1]);
+            } else {
+              unsigned a = convert_hex_to_binary(pointer[i + 1]);
+              unsigned b = convert_hex_to_binary(pointer[i + 2]);
+              outbuf[outlen++] = static_cast<char>(a * 16 + b);
+            }
+            i += 3;
+          } else {
+            outbuf[outlen++] = pointer[i];
+            i++;
+          }
+        } else {
+          outbuf[outlen++] = pointer[i];
+          i++;
+        }
+      }
+      dest.append(outbuf, outlen);
+      pointer += i;
     }
   }
 #elif ADA_LSX

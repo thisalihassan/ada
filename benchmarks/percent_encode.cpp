@@ -322,6 +322,26 @@ static void Decode(benchmark::State& state) {
 }
 BENCHMARK(Decode);
 
+static void DecodeDense(benchmark::State& state) {
+  // Every byte is percent-encoded: %00%01%02...%FE%FF repeated.
+  // This is the worst case for "scan + scalar" and best case for batch SIMD.
+  std::string dense;
+  dense.reserve(256 * 3);
+  for (int i = 0; i < 256; i++) {
+    char buf[4];
+    snprintf(buf, sizeof(buf), "%%%02X", i);
+    dense += buf;
+  }
+  double dense_bytes = double(dense.size());
+  size_t first = dense.find('%');
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(ada::unicode::percent_decode(dense, first));
+  }
+  state.counters["speed"] = benchmark::Counter(
+      dense_bytes, benchmark::Counter::kIsIterationInvariantRate);
+}
+BENCHMARK(DecodeDense);
+
 static void DecodeClean(benchmark::State& state) {
   std::string clean(200, 'a');
   for (auto _ : state) {
