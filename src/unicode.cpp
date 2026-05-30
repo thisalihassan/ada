@@ -597,20 +597,6 @@ ada_really_inline int trailing_zeroes(uint32_t input_num) noexcept {
 #endif
 }
 
-static ada_really_inline bool percent_decode_consecutive(const char*& pointer,
-                                                         const char* end,
-                                                         std::string& dest) {
-  const char* start = pointer;
-  while (pointer + 2 < end && pointer[0] == '%' &&
-         is_ascii_hex_digit(pointer[1]) && is_ascii_hex_digit(pointer[2])) {
-    unsigned a = convert_hex_to_binary(pointer[1]);
-    unsigned b = convert_hex_to_binary(pointer[2]);
-    dest += static_cast<char>(a * 16 + b);
-    pointer += 3;
-  }
-  return pointer != start;
-}
-
 std::string percent_decode(const std::string_view input, size_t first_percent) {
   // next line is for safety only, we expect users to avoid calling
   // percent_decode when first_percent is outside the range.
@@ -640,10 +626,6 @@ std::string percent_decode(const std::string_view input, size_t first_percent) {
       dest.append(pointer, skip);
       pointer += skip;
     }
-    if (pointer + 6 < end && pointer[3] == '%' && pointer[6] == '%' &&
-        percent_decode_consecutive(pointer, end, dest)) {
-      continue;
-    }
     size_t remaining = end - pointer - 1;
     if (remaining >= 2 && is_ascii_hex_digit(pointer[1]) &&
         is_ascii_hex_digit(pointer[2])) {
@@ -671,10 +653,6 @@ std::string percent_decode(const std::string_view input, size_t first_percent) {
     if (skip > 0) {
       dest.append(pointer, skip);
       pointer += skip;
-    }
-    if (pointer + 6 < end && pointer[3] == '%' && pointer[6] == '%' &&
-        percent_decode_consecutive(pointer, end, dest)) {
-      continue;
     }
     size_t remaining = end - pointer - 1;
     if (remaining >= 2 && is_ascii_hex_digit(pointer[1]) &&
@@ -704,10 +682,6 @@ std::string percent_decode(const std::string_view input, size_t first_percent) {
       dest.append(pointer, skip);
       pointer += skip;
     }
-    if (pointer + 6 < end && pointer[3] == '%' && pointer[6] == '%' &&
-        percent_decode_consecutive(pointer, end, dest)) {
-      continue;
-    }
     size_t remaining = end - pointer - 1;
     if (remaining >= 2 && is_ascii_hex_digit(pointer[1]) &&
         is_ascii_hex_digit(pointer[2])) {
@@ -735,10 +709,6 @@ std::string percent_decode(const std::string_view input, size_t first_percent) {
     if (idx > 0) {
       dest.append(pointer, idx);
       pointer += idx;
-    }
-    if (pointer + 6 < end && pointer[3] == '%' && pointer[6] == '%' &&
-        percent_decode_consecutive(pointer, end, dest)) {
-      continue;
     }
     size_t remaining = end - pointer - 1;
     if (remaining >= 2 && is_ascii_hex_digit(pointer[1]) &&
