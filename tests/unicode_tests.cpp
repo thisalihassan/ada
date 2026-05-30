@@ -79,6 +79,22 @@ TEST(unicode_tests, percent_decode_boundaries_and_invalid_sequences) {
             "plain-text");
 }
 
+TEST(unicode_tests, percent_decode_dense_sequence) {
+  constexpr char hex[] = "0123456789ABCDEF";
+  std::string dense;
+  std::string expected;
+  dense.reserve(256 * 3);
+  expected.reserve(256);
+  for (int i = 0; i < 256; i++) {
+    dense.push_back('%');
+    dense.push_back(hex[i >> 4]);
+    dense.push_back(hex[i & 0xF]);
+    expected.push_back(static_cast<char>(i));
+  }
+
+  EXPECT_EQ(ada::unicode::percent_decode(dense, dense.find('%')), expected);
+}
+
 TYPED_TEST(unicode_setter_tests, set_search_and_hash_encode_boundary_spaces) {
   auto url = ada::parse<TypeParam>("https://example.com/");
   ASSERT_TRUE(url);
