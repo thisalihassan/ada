@@ -447,7 +447,42 @@ unsigned constexpr convert_hex_to_binary(const char c) noexcept {
   return hex_to_binary_table[c - '0'];
 }
 
+static ada_really_inline size_t percent_encode_index_scalar(
+    const char* data, const size_t size, const uint8_t character_set[]) {
+  size_t i = 0;
+  for (; i + 8 <= size; i += 8) {
+    unsigned char chunk[8];
+    std::memcpy(&chunk, data + i, 8);
+    for (size_t j = 0; j < 8; j++) {
+      if (character_sets::bit_at(character_set, chunk[j])) {
+        return i + j;
+      }
+    }
+  }
+  for (; i < size; i++) {
+    if (character_sets::bit_at(character_set, data[i])) {
+      return i;
+    }
+  }
+  return size;
+}
+
+static ada_really_inline void percent_encode_to_scalar(
+    const char* p, const char* pend, const uint8_t character_set[],
+    std::string& out) {
+  while (p < pend) {
+    if (character_sets::bit_at(character_set, *p)) {
+      out.append(character_sets::hex + uint8_t(*p) * 4, 3);
+    } else {
+      out += *p;
+    }
+    p++;
+  }
+}
+
 #if ADA_SSSE3
+constexpr size_t percent_encode_ssse3_minimum_length = 64;
+
 // Prebuilt nibble-decomposition LUTs for SSSE3 percent-encode.
 // Constructed once from character_set, then shared across index + encode
 // to avoid the 128-iteration build cost being paid twice per call.
@@ -503,11 +538,8 @@ static size_t percent_encode_index_simd(const std::string_view input,
 size_t percent_encode_index(const std::string_view input,
                             const uint8_t character_set[]) {
   const size_t size = input.size();
-  if (size < 16) {
-    for (size_t i = 0; i < size; i++) {
-      if (character_sets::bit_at(character_set, input.data()[i])) return i;
-    }
-    return size;
+  if (size < percent_encode_ssse3_minimum_length) {
+    return percent_encode_index_scalar(input.data(), size, character_set);
   }
   ssse3_encode_luts luts(character_set);
   return percent_encode_index_simd(input, character_set, luts);
@@ -551,24 +583,7 @@ size_t percent_encode_index(const std::string_view input,
 #else
 size_t percent_encode_index(const std::string_view input,
                             const uint8_t character_set[]) {
-  const char* data = input.data();
-  const size_t size = input.size();
-  size_t i = 0;
-  for (; i + 8 <= size; i += 8) {
-    unsigned char chunk[8];
-    std::memcpy(&chunk, data + i, 8);
-    for (size_t j = 0; j < 8; j++) {
-      if (character_sets::bit_at(character_set, chunk[j])) {
-        return i + j;
-      }
-    }
-  }
-  for (; i < size; i++) {
-    if (character_sets::bit_at(character_set, data[i])) {
-      return i;
-    }
-  }
-  return size;
+  return percent_encode_index_scalar(input.data(), input.size(), character_set);
 }
 #endif
 
@@ -774,9 +789,11 @@ static ada_really_inline void percent_encode_to(const char* p, const char* pend,
                                                 const uint8_t character_set[],
                                                 std::string& out) {
 #if ADA_SSSE3
-  ssse3_encode_luts luts(character_set);
-  percent_encode_to_simd(p, pend, character_set, out, luts);
-  return;
+  if (size_t(pend - p) >= percent_encode_ssse3_minimum_length) {
+    ssse3_encode_luts luts(character_set);
+    percent_encode_to_simd(p, pend, character_set, out, luts);
+    return;
+  }
 #elif ADA_NEON
   uint8x16x2_t cs_table;
   cs_table.val[0] = vld1q_u8(character_set);
@@ -808,30 +825,26 @@ static ada_really_inline void percent_encode_to(const char* p, const char* pend,
     p++;
   }
 #endif
-  // Scalar tail for remaining < 16 bytes.
-  while (p < pend) {
-    if (character_sets::bit_at(character_set, *p)) {
-      out.append(character_sets::hex + uint8_t(*p) * 4, 3);
-    } else {
-      out += *p;
-    }
-    p++;
-  }
+  percent_encode_to_scalar(p, pend, character_set, out);
 }
 
 std::string percent_encode(const std::string_view input,
                            const uint8_t character_set[]) {
 #if ADA_SSSE3
-  if (input.size() >= 16) {
+  if (input.size() >= percent_encode_ssse3_minimum_length) {
     ssse3_encode_luts luts(character_set);
     size_t first_idx = percent_encode_index_simd(input, character_set, luts);
     if (first_idx == input.size()) return std::string(input);
     std::string result;
     result.reserve(input.length());
     result.append(input.substr(0, first_idx));
-    percent_encode_to_simd(input.data() + first_idx,
-                           input.data() + input.size(), character_set, result,
-                           luts);
+    const char* p = input.data() + first_idx;
+    const char* pend = input.data() + input.size();
+    if (size_t(pend - p) >= percent_encode_ssse3_minimum_length) {
+      percent_encode_to_simd(p, pend, character_set, result, luts);
+    } else {
+      percent_encode_to_scalar(p, pend, character_set, result);
+    }
     return result;
   }
 #endif
@@ -853,7 +866,7 @@ bool percent_encode(const std::string_view input, const uint8_t character_set[],
   ada_log("percent_encode ", input, " to output string while ",
           append ? "appending" : "overwriting");
 #if ADA_SSSE3
-  if (input.size() >= 16) {
+  if (input.size() >= percent_encode_ssse3_minimum_length) {
     ssse3_encode_luts luts(character_set);
     size_t first_idx = percent_encode_index_simd(input, character_set, luts);
     ada_log("percent_encode done checking, moved to ", first_idx);
@@ -867,9 +880,13 @@ bool percent_encode(const std::string_view input, const uint8_t character_set[],
     ada_log("percent_encode appending ", first_idx, " bytes");
     out.append(input.substr(0, first_idx));
     ada_log("percent_encode processing ", input.size() - first_idx, " bytes");
-    percent_encode_to_simd(input.data() + first_idx,
-                           input.data() + input.size(), character_set, out,
-                           luts);
+    const char* p = input.data() + first_idx;
+    const char* pend = input.data() + input.size();
+    if (size_t(pend - p) >= percent_encode_ssse3_minimum_length) {
+      percent_encode_to_simd(p, pend, character_set, out, luts);
+    } else {
+      percent_encode_to_scalar(p, pend, character_set, out);
+    }
     return true;
   }
 #endif

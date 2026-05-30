@@ -17,13 +17,20 @@ TEST(unicode_tests, percent_encode_index_boundaries) {
   std::string at_15 = std::string(15, 'a') + "|" + std::string(16, 'b');
   std::string at_16 = std::string(16, 'a') + "|" + std::string(15, 'b');
   std::string at_17 = std::string(17, 'a') + "|" + std::string(14, 'b');
+  std::string at_63 = std::string(63, 'a') + "|";
+  std::string at_64 = std::string(64, 'a') + "|";
   std::string clean(32, 'a');
+  std::string clean_long(96, 'a');
   std::string non_ascii = std::string(16, 'a') + std::string(1, char(0xE1));
 
   EXPECT_EQ(ada::unicode::percent_encode_index(at_15, userinfo), 15u);
   EXPECT_EQ(ada::unicode::percent_encode_index(at_16, userinfo), 16u);
   EXPECT_EQ(ada::unicode::percent_encode_index(at_17, userinfo), 17u);
+  EXPECT_EQ(ada::unicode::percent_encode_index(at_63, userinfo), 63u);
+  EXPECT_EQ(ada::unicode::percent_encode_index(at_64, userinfo), 64u);
   EXPECT_EQ(ada::unicode::percent_encode_index(clean, userinfo), clean.size());
+  EXPECT_EQ(ada::unicode::percent_encode_index(clean_long, userinfo),
+            clean_long.size());
   EXPECT_EQ(ada::unicode::percent_encode_index(non_ascii, query), 16u);
 }
 
@@ -43,6 +50,11 @@ TEST(unicode_tests, percent_encode_with_index_matches_full_encode) {
   std::string non_ascii = std::string(16, 'a') + std::string(1, char(0xE1));
   EXPECT_EQ(ada::unicode::percent_encode(non_ascii, query),
             std::string(16, 'a') + "%E1");
+
+  std::string long_needs_encoding =
+      std::string(64, 'a') + "|" + std::string(64, 'b');
+  EXPECT_EQ(ada::unicode::percent_encode(long_needs_encoding, userinfo),
+            std::string(64, 'a') + "%7C" + std::string(64, 'b'));
 }
 
 TEST(unicode_tests, percent_decode_boundaries_and_invalid_sequences) {
